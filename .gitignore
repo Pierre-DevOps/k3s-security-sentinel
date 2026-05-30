@@ -1,0 +1,11 @@
+*.env
+.env*
+secrets.yaml
+*-secret.yaml
+*-secrets.yaml
+*.log
+__pycache__/
+*.pyc
+security-api.py
+*-n8n.json
+linkedin-post-*.md

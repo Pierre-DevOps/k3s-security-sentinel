@@ -1,0 +1,419 @@
+---
+# ──────────────────────────────────────────────────────────────────────────────
+# AI Security Sentinel — Manifests K8s
+# Namespace: security-sentinel
+# Pierre-DevOps | pierre.devops08@gmail.com
+# ──────────────────────────────────────────────────────────────────────────────
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security-sentinel
+  labels:
+    app.kubernetes.io/name: security-sentinel
+    app.kubernetes.io/managed-by: argocd
+
+---
+# ─── RBAC : ServiceAccount avec droits lecture cluster ────────────────────────
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: security-sentinel
+  namespace: security-sentinel
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: security-sentinel-reader
+rules:
+  # Lecture pods, services, secrets (liste uniquement, pas le contenu)
+  - apiGroups: [""]
+    resources: ["pods", "services", "namespaces", "serviceaccounts", "secrets"]
+    verbs: ["get", "list", "watch"]
+  # Lecture NetworkPolicies
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "list", "watch"]
+  # Lecture RBAC pour détecter les SA trop permissifs
+  - apiGroups: ["rbac.authorization.k8s.io"]
+    resources: ["clusterrolebindings", "rolebindings", "clusterroles", "roles"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: security-sentinel-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: security-sentinel-reader
+subjects:
+  - kind: ServiceAccount
+    name: security-sentinel
+    namespace: security-sentinel
+
+---
+# ─── Secret : clé Groq (à injecter via kubectl) ───────────────────────────────
+# kubectl create secret generic security-sentinel-secrets \
+#   --from-literal=groq_api_key=gsk_XXXXXX \
+#   --from-literal=github_token=ghp_XXXXXX \
+#   --from-literal=brevo_api_key=xkeysib-XXXXXX \
+#   --from-literal=postgres_password=$(openssl rand -base64 32) \
+#   -n security-sentinel
+#
+# Ne pas stocker les vraies valeurs ici !
+apiVersion: v1
+kind: Secret
+metadata:
+  name: security-sentinel-secrets
+  namespace: security-sentinel
+type: Opaque
+stringData:
+  groq_api_key: "CHANGE_ME"
+  github_token: "CHANGE_ME"
+  brevo_api_key: "CHANGE_ME"
+  postgres_password: "CHANGE_ME"
+
+---
+# ─── ConfigMap : configuration applicative ────────────────────────────────────
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-sentinel-config
+  namespace: security-sentinel
+data:
+  SCAN_INTERVAL: "300"
+  RISK_THRESHOLD_CRITICAL: "80"
+  RISK_THRESHOLD_HIGH: "50"
+  GITHUB_REPO: "Pierre-DevOps/homelab-k8s"
+  GITHUB_BRANCH: "main"
+  ALERT_EMAIL: "pierre.devops08@gmail.com"
+  POSTGRES_HOST: "postgres-sentinel"
+  POSTGRES_PORT: "5432"
+  POSTGRES_DB: "security_sentinel"
+  POSTGRES_USER: "sentinel"
+  FLASK_PORT: "5000"
+  ALLOWED_NODEPORTS: "31701,31702,31703,31704,30500,30900,30300,30301,31760,5678"
+
+---
+# ─── PostgreSQL : stockage des incidents ──────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-sentinel
+  namespace: security-sentinel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-sentinel
+  template:
+    metadata:
+      labels:
+        app: postgres-sentinel
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: security_sentinel
+            - name: POSTGRES_USER
+              value: sentinel
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: security-sentinel-secrets
+                  key: postgres_password
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: pgdata
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: pgdata
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-sentinel
+  namespace: security-sentinel
+spec:
+  selector:
+    app: postgres-sentinel
+  ports:
+    - port: 5432
+      targetPort: 5432
+
+---
+# ─── Scanner : collecte des métriques sécurité ────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-scanner
+  namespace: security-sentinel
+  labels:
+    app: security-scanner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-scanner
+  template:
+    metadata:
+      labels:
+        app: security-scanner
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: security-sentinel
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: scanner
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install kubernetes prometheus-client --quiet &&
+              python /app/security-scanner.py
+          ports:
+            - containerPort: 8000
+              name: metrics
+          env:
+            - name: SCAN_INTERVAL
+              valueFrom:
+                configMapKeyRef:
+                  name: security-sentinel-config
+                  key: SCAN_INTERVAL
+            - name: ALLOWED_NODEPORTS
+              valueFrom:
+                configMapKeyRef:
+                  name: security-sentinel-config
+                  key: ALLOWED_NODEPORTS
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: scanner-code
+              mountPath: /app
+      volumes:
+        - name: scanner-code
+          configMap:
+            name: security-scanner-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-scanner
+  namespace: security-sentinel
+  labels:
+    app: security-scanner
+spec:
+  selector:
+    app: security-scanner
+  ports:
+    - port: 8000
+      targetPort: 8000
+      name: metrics
+
+---
+# ─── Flask API : dashboard + endpoints ────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: security-api
+  namespace: security-sentinel
+  labels:
+    app: security-api
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: security-api
+  template:
+    metadata:
+      labels:
+        app: security-api
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: api
+          image: python:3.12-slim
+          command:
+            - sh
+            - -c
+            - |
+              pip install flask psycopg2-binary requests --quiet &&
+              python /app/security-api.py
+          ports:
+            - containerPort: 5000
+              name: http
+          envFrom:
+            - configMapRef:
+                name: security-sentinel-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: security-sentinel-secrets
+                  key: postgres_password
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: security-sentinel-secrets
+                  key: groq_api_key
+            - name: BREVO_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: security-sentinel-secrets
+                  key: brevo_api_key
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: security-sentinel-secrets
+                  key: github_token
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          volumeMounts:
+            - name: api-code
+              mountPath: /app
+      volumes:
+        - name: api-code
+          configMap:
+            name: security-api-code
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: security-api
+  namespace: security-sentinel
+spec:
+  selector:
+    app: security-api
+  type: NodePort
+  ports:
+    - port: 5000
+      targetPort: 5000
+      nodePort: 31800   # Ajouter 31800 à ta liste ALLOWED_NODEPORTS
+
+---
+# ─── NetworkPolicy : isolation du namespace ───────────────────────────────────
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-ingress
+  namespace: security-sentinel
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Autoriser seulement le scraping Prometheus (namespace monitoring)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - port: 8000
+    # Autoriser l'accès à l'API Flask depuis n'importe où (Cloudflare Tunnel)
+    - ports:
+        - port: 5000
+    # Communication interne au namespace
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: security-sentinel
+
+---
+# ─── PrometheusRule : alertes sur le score de risque ─────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: security-sentinel-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    - name: security-sentinel
+      interval: 60s
+      rules:
+        - alert: SecurityRiskCritical
+          expr: security_risk_score >= 80
+          for: 2m
+          labels:
+            severity: critical
+            team: pierre-devops
+          annotations:
+            summary: "🚨 Score sécurité CRITIQUE: {{ $value }}/100"
+            description: "Le cluster K8s a un score de risque de {{ $value }}/100. Intervention immédiate requise."
+            dashboard: "https://security.pierre-devops.com"
+
+        - alert: SecurityRiskHigh
+          expr: security_risk_score >= 50 and security_risk_score < 80
+          for: 5m
+          labels:
+            severity: warning
+            team: pierre-devops
+          annotations:
+            summary: "⚠️ Score sécurité ÉLEVÉ: {{ $value }}/100"
+            description: "Le cluster K8s a un score de risque de {{ $value }}/100."
+
+        - alert: SecretsExposedCritical
+          expr: security_exposed_secrets_total > 0
+          for: 1m
+          labels:
+            severity: critical
+          annotations:
+            summary: "🔑 {{ $value }} secret(s) exposé(s) en clair !"
+            description: "Des secrets sont exposés en clair dans des variables d'environnement."
+
+        - alert: RootContainersDetected
+          expr: security_root_containers_total > 5
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "⚡ {{ $value }} containers tournent en root"
+
+---
+# ─── ServiceMonitor : scraping par Prometheus ────────────────────────────────
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: security-scanner
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  namespaceSelector:
+    matchNames:
+      - security-sentinel
+  selector:
+    matchLabels:
+      app: security-scanner
+  endpoints:
+    - port: metrics
+      interval: 60s
+      path: /metrics
