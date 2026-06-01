@@ -170,12 +170,19 @@ def check_exposed_nodeports(v1: client.CoreV1Api, namespaces: list) -> dict:
 def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dict:
     findings = []
     dangerous = {"cluster-admin", "admin", "edit"}
+    # SA système K3s/Traefik — faux positifs normaux
+    WHITELISTED_SA = {
+        "helm-traefik",
+        "helm-traefik-crd",
+        "traefik",
+        "local-path-provisioner-service-account",
+    }
     try:
         for crb in rbac.list_cluster_role_binding().items:
             if crb.role_ref.name not in dangerous:
                 continue
             for subject in (crb.subjects or []):
-                if subject.kind == "ServiceAccount":
+                if subject.kind == "ServiceAccount" and subject.name not in WHITELISTED_SA:
                     findings.append({
                         "namespace": subject.namespace or "cluster-wide",
                         "serviceaccount": subject.name,
