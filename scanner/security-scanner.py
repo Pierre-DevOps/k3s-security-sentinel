@@ -198,14 +198,17 @@ def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dic
 
 
 def compute_risk_score(results: dict) -> int:
-    weights = {"CRITICAL": 15, "HIGH": 8, "MEDIUM": 4}
+    weights = {
+        "CRITICAL": 15,  # secrets exposes, SA cluster-admin
+        "HIGH": 4,       # containers root, NetworkPolicy — risque reel mais moins urgent
+        "MEDIUM": 2,
+    }
     score = sum(
-        weights.get(f.get("severity", "HIGH"), 4)
+        weights.get(f.get("severity", "HIGH"), 2)
         for r in results.values()
         for f in r["findings"]
     )
     return min(score, 100)
-
 
 def run_scan() -> None:
     t_start = time.time()
