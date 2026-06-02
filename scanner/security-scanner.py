@@ -31,19 +31,19 @@ SECRET_KEYWORDS = {
     "jwt", "bearer",
 }
 
-# ─── Métriques Prometheus ──────────────────────────────────────────────────────
+# Metriques Prometheus
 RISK_SCORE       = Gauge("security_risk_score", "Score de risque global 0-100")
 ROOT_CONTAINERS  = Gauge("security_root_containers_total", "Containers sans runAsNonRoot")
 MISSING_NETPOL   = Gauge("security_missing_networkpolicy_total", "Namespaces sans NetworkPolicy")
 EXPOSED_SECRETS  = Gauge("security_exposed_secrets_total", "Secrets en clair dans env vars")
 PRIVILEGED_SA    = Gauge("security_privileged_serviceaccounts_total", "ServiceAccounts trop permissifs")
 EXPOSED_NODEPORT = Gauge("security_exposed_nodeports_total", "NodePorts hors liste blanche")
-SCAN_DURATION    = Gauge("security_scan_duration_seconds", "Durée du dernier scan")
+SCAN_DURATION    = Gauge("security_scan_duration_seconds", "Duree du dernier scan")
 SCAN_ERRORS      = Counter("security_scan_errors_total", "Erreurs de scan", ["check_type"])
 
 
 def get_allowed_nodeports() -> set:
-    """Lit ALLOWED_NODEPORTS depuis l'env à chaque appel — pas au démarrage."""
+    """Lit ALLOWED_NODEPORTS depuis l'env a chaque appel."""
     raw = os.environ.get("ALLOWED_NODEPORTS", "")
     return {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
 
@@ -170,7 +170,7 @@ def check_exposed_nodeports(v1: client.CoreV1Api, namespaces: list) -> dict:
 def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dict:
     findings = []
     dangerous = {"cluster-admin", "admin", "edit"}
-    # SA système K3s/Traefik — faux positifs normaux
+    # SA systeme K3s/Traefik — faux positifs normaux
     WHITELISTED_SA = {
         "helm-traefik",
         "helm-traefik-crd",
@@ -189,7 +189,7 @@ def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dic
                         "role": crb.role_ref.name,
                         "binding": crb.metadata.name,
                         "severity": "CRITICAL" if crb.role_ref.name == "cluster-admin" else "HIGH",
-                        "reason": f"SA lié à {crb.role_ref.name}",
+                        "reason": f"SA lie a {crb.role_ref.name}",
                     })
     except ApiException as e:
         log.error(f"[serviceaccounts] {e}")
@@ -209,7 +209,7 @@ def compute_risk_score(results: dict) -> int:
 
 def run_scan() -> None:
     t_start = time.time()
-    log.info("🔍 Scan sécurité démarré...")
+    log.info("Scan securite demarre...")
 
     try:
         config.load_incluster_config()
@@ -242,17 +242,17 @@ def run_scan() -> None:
     SCAN_DURATION.set(time.time() - t_start)
 
     total = sum(r["count"] for r in results.values())
-    emoji = "🔴" if score >= 80 else "🟡" if score >= 50 else "🟢"
-    log.info(f"{emoji} Score: {score}/100 | Findings: {total} | Durée: {time.time() - t_start:.1f}s")
+    level = "[CRIT]" if score >= 80 else "[WARN]" if score >= 50 else "[OK]"
+    log.info(f"{level} Score: {score}/100 | Findings: {total} | Duree: {time.time() - t_start:.1f}s")
     for name, result in results.items():
-        if result["count"]:
-            log.warning(f"   ⚠️  {name}: {result['count']} finding(s)")
-            for f in result["findings"][:3]:
-                log.warning(f"      → {f}")
+        if result['count']:
+            log.warning(f"  [{name}] {result['count']} finding(s)")
+            for f in result['findings'][:3]:
+                log.warning(f"      -> {f}")
 
 
 if __name__ == "__main__":
-    log.info(f"🚀 Security Scanner démarré — métriques sur :8000 — scan toutes les {SCAN_INTERVAL}s")
+    log.info(f"Security Scanner demarre — metriques sur :8000 — scan toutes les {SCAN_INTERVAL}s")
     start_http_server(8000)
     while True:
         run_scan()
