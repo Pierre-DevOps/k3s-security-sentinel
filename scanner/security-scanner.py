@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-K3s Security Sentinel — Security Scanner
-Collecte les findings de sécurité K8s et expose des métriques Prometheus.
+K3s Security Sentinel -- Security Scanner
+Collecte les findings de securite K8s et expose des metriques Prometheus.
+Sauvegarde l'historique dans PostgreSQL a chaque scan.
+Calcule et expose le MTTR par type de finding.
 """
 
 import os
 import time
 import logging
+import psycopg2
 from prometheus_client import start_http_server, Gauge, Counter
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
@@ -40,12 +43,73 @@ PRIVILEGED_SA    = Gauge("security_privileged_serviceaccounts_total", "ServiceAc
 EXPOSED_NODEPORT = Gauge("security_exposed_nodeports_total", "NodePorts hors liste blanche")
 SCAN_DURATION    = Gauge("security_scan_duration_seconds", "Duree du dernier scan")
 SCAN_ERRORS      = Counter("security_scan_errors_total", "Erreurs de scan", ["check_type"])
+MTTR_MINUTES     = Gauge("security_mttr_minutes", "MTTR par type de finding en minutes", ["finding_type"])
 
 
 def get_allowed_nodeports() -> set:
     """Lit ALLOWED_NODEPORTS depuis l'env a chaque appel."""
     raw = os.environ.get("ALLOWED_NODEPORTS", "")
     return {int(p.strip()) for p in raw.split(",") if p.strip().isdigit()}
+
+
+def update_mttr_metrics() -> None:
+    """Calcule et expose les metriques MTTR depuis PostgreSQL."""
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get("POSTGRES_HOST", "postgres-sentinel"),
+            port=int(os.environ.get("POSTGRES_PORT", 5432)),
+            dbname=os.environ.get("POSTGRES_DB", "security_sentinel"),
+            user=os.environ.get("POSTGRES_USER", "sentinel"),
+            password=os.environ.get("POSTGRES_PASSWORD", "")
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT finding_type, mttr_minutes
+                FROM mttr_metrics
+                WHERE mttr_minutes IS NOT NULL
+            """)
+            for row in cur.fetchall():
+                finding_type, mttr_minutes = row
+                MTTR_MINUTES.labels(finding_type=finding_type).set(float(mttr_minutes))
+                log.info(f"   [mttr] {finding_type}: {round(float(mttr_minutes), 1)} min")
+        conn.close()
+    except Exception as e:
+        log.error(f"[mttr] Erreur calcul MTTR: {e}")
+
+
+def save_scan_to_db(score: int, level: str, results: dict, duration_ms: int) -> None:
+    """Sauvegarde les resultats du scan dans PostgreSQL pour historique et MTTR."""
+    try:
+        conn = psycopg2.connect(
+            host=os.environ.get("POSTGRES_HOST", "postgres-sentinel"),
+            port=int(os.environ.get("POSTGRES_PORT", 5432)),
+            dbname=os.environ.get("POSTGRES_DB", "security_sentinel"),
+            user=os.environ.get("POSTGRES_USER", "sentinel"),
+            password=os.environ.get("POSTGRES_PASSWORD", "")
+        )
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO scan_history
+                    (risk_score, level, findings_total,
+                     root_containers, missing_netpol, exposed_secrets,
+                     exposed_nodeports, privileged_sa, scan_duration_ms)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                score,
+                level,
+                sum(r["count"] for r in results.values()),
+                results["root_containers"]["count"],
+                results["network_policies"]["count"],
+                results["exposed_secrets"]["count"],
+                results["exposed_nodeports"]["count"],
+                results["privileged_sa"]["count"],
+                duration_ms
+            ))
+            conn.commit()
+        conn.close()
+        log.info("   [db] Scan sauvegarde dans PostgreSQL")
+    except Exception as e:
+        log.error(f"[db] Erreur sauvegarde scan: {e}")
 
 
 def get_namespaces(v1: client.CoreV1Api) -> list:
@@ -170,7 +234,6 @@ def check_exposed_nodeports(v1: client.CoreV1Api, namespaces: list) -> dict:
 def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dict:
     findings = []
     dangerous = {"cluster-admin", "admin", "edit"}
-    # SA systeme K3s/Traefik — faux positifs normaux
     WHITELISTED_SA = {
         "helm-traefik",
         "helm-traefik-crd",
@@ -199,8 +262,8 @@ def check_privileged_serviceaccounts(rbac: client.RbacAuthorizationV1Api) -> dic
 
 def compute_risk_score(results: dict) -> int:
     weights = {
-        "CRITICAL": 15,  # secrets exposes, SA cluster-admin
-        "HIGH": 4,       # containers root, NetworkPolicy — risque reel mais moins urgent
+        "CRITICAL": 15,
+        "HIGH": 4,
         "MEDIUM": 2,
     }
     score = sum(
@@ -209,6 +272,7 @@ def compute_risk_score(results: dict) -> int:
         for f in r["findings"]
     )
     return min(score, 100)
+
 
 def run_scan() -> None:
     t_start = time.time()
@@ -242,20 +306,25 @@ def run_scan() -> None:
 
     score = compute_risk_score(results)
     RISK_SCORE.set(score)
-    SCAN_DURATION.set(time.time() - t_start)
+
+    duration_ms = int((time.time() - t_start) * 1000)
+    SCAN_DURATION.set(duration_ms / 1000)
 
     total = sum(r["count"] for r in results.values())
     level = "[CRIT]" if score >= 80 else "[WARN]" if score >= 50 else "[OK]"
-    log.info(f"{level} Score: {score}/100 | Findings: {total} | Duree: {time.time() - t_start:.1f}s")
+    log.info(f"{level} Score: {score}/100 | Findings: {total} | Duree: {duration_ms}ms")
     for name, result in results.items():
         if result['count']:
             log.warning(f"  [{name}] {result['count']} finding(s)")
             for f in result['findings'][:3]:
                 log.warning(f"      -> {f}")
 
+    update_mttr_metrics()
+    save_scan_to_db(score, level, results, duration_ms)
+
 
 if __name__ == "__main__":
-    log.info(f"Security Scanner demarre — metriques sur :8000 — scan toutes les {SCAN_INTERVAL}s")
+    log.info(f"Security Scanner demarre -- metriques sur :8000 -- scan toutes les {SCAN_INTERVAL}s")
     start_http_server(8000)
     while True:
         run_scan()
