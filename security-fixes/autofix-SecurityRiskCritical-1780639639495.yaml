@@ -1,0 +1,17 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autovoxpro
+  namespace: autovoxpro
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: autovoxpro
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
